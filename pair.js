@@ -40,7 +40,8 @@ router.get('/', async (req, res) => {
             if (!session.authState.creds.registered) {
                 await delay(1500);
                 num = num.replace(/[^0-9]/g, '');
-                const code = await session.requestPairingCode(num);
+                const rawCode = await session.requestPairingCode(num);
+                const code = rawCode?.match(/.{1,4}/g)?.join('-') ?? rawCode;
                 if (!res.headersSent) {
                     await res.send({ code });
                 }
