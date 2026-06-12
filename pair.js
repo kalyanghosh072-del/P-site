@@ -1,86 +1,136 @@
-const axios = require('axios');
-const { MONGODB_URL, SESSION_NAME } = require('./config');
-const { makeid } = require('./id');
+'use strict';
+
 const express = require('express');
-const fs = require('fs');
-let router = express.Router();
-const pino = require("pino");
+const fs      = require('fs');
+const path    = require('path');
+const { v4: uuidv4 } = require('uuid');
+const pino    = require('pino');
 const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    delay,
-    Browsers,
-    makeCacheableSignalKeyStore
-} = require("@whiskeysockets/baileys");
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  Browsers,
+  fetchLatestBaileysVersion,
+} = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
 
-function removeFile(FilePath) {
-    if (!fs.existsSync(FilePath)) return false;
-    fs.rmSync(FilePath, { recursive: true, force: true });
-};
+let router = express.Router();
 
-router.get('/', async (req, res) => {
-    const id = makeid();
-    let num = req.query.number;
+const SESSIONS_DIR = path.join(process.cwd(), 'temp');
+if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
-    if (!fs.existsSync('./temp')) fs.mkdirSync('./temp', { recursive: true });
+const sessions = new Map();
 
-    async function getPaire() {
-        const { state, saveCreds } = await useMultiFileAuthState('./temp/' + id);
-        try {
-            let session = makeWASocket({
-                auth: {
-                    creds: state.creds,
-                    keys: makeCacheableSignalKeyStore(state.keys, pino({level: "fatal"}).child({level: "fatal"})),
-                },
-                printQRInTerminal: false,
-                logger: pino({level: "fatal"}).child({level: "fatal"}),
-                browser: Browsers.macOS("Safari"),
-             });
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
 
-            if (!session.authState.creds.registered) {
-                await delay(1500);
-                num = num.replace(/[^0-9]/g, '');
-                const rawCode = await session.requestPairingCode(num);
-                const code = rawCode?.match(/.{1,4}/g)?.join('-') ?? rawCode;
-                if (!res.headersSent) {
-                    await res.send({ code });
-                }
-            }
+function cleanup(sessionId, entry) {
+  if (entry.cleaned) return;
+  entry.cleaned = true;
+  try {
+    if (entry.socket) { entry.socket.ws?.close(); entry.socket = null; }
+    const dir = path.join(SESSIONS_DIR, sessionId);
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  } catch (_) {}
+  setTimeout(() => sessions.delete(sessionId), 60000);
+}
 
-            session.ev.on('creds.update', saveCreds);
+async function startSession(sessionId, phone) {
+  const authDir = path.join(SESSIONS_DIR, sessionId);
+  fs.mkdirSync(authDir, { recursive: true });
 
-            session.ev.on("connection.update", async (s) => {
-                const { connection, lastDisconnect } = s;
+  const entry = {
+    status: 'waiting',
+    pairingCode: null,
+    error: null,
+    phone,
+    socket: null,
+    cleaned: false,
+  };
+  sessions.set(sessionId, entry);
 
-                if (connection == "open") {
-                    await delay(5000);
-                    await delay(5000);
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    const { state: authState, saveCreds } = await useMultiFileAuthState(authDir);
+    const logger = pino({ level: 'silent' });
 
-                    const jsonData = await fs.promises.readFile(`${__dirname}/temp/${id}/creds.json`, 'utf-8');
-                    const base64Session = Buffer.from(jsonData).toString('base64');
+    const sock = makeWASocket({
+      version,
+      logger,
+      printQRInTerminal: false,
+      auth: authState,
+      browser: Browsers.macOS('Safari'),
+    });
 
-                    await session.sendMessage(session.user.id, { text: ` *🔥⃝ᴛʜᴀɴᴋ чᴏᴜ ғᴏʀ ᴄʜᴏᴏꜱɪɴɢ ᴍʀ-ᴀɴᴊᴀɴ⭜*
-                    *🔥⃝ᴛʜɪꜱ ɪꜱ ʏᴏᴜʀ ꜱᴇꜱꜱɪᴏɴ ɪᴅ ᴩʟᴇᴀꜱᴇ ᴅᴏ ɴᴏᴛ ꜱʜᴀʀᴇ ᴛʜɪꜱ ᴄᴏᴅᴇ ᴡɪᴛʜ ᴀɴʏᴏɴᴇ ⛒⭜*` });
-                    await session.sendMessage(session.user.id, { text: SESSION_NAME + base64Session });
+    entry.socket = sock;
+    sock.ev.on('creds.update', saveCreds);
 
-                    await delay(100);
-                    await session.ws.close();
-                    return await removeFile('./temp/' + id);
-                } else if (connection === "close" && lastDisconnect && lastDisconnect.error && lastDisconnect.error.output.statusCode != 401) {
-                    await delay(10000);
-                    getPaire();
-                }
-            });
-        } catch (err) {
-            console.log("service restated:", err.message, err.stack);
-            await removeFile('./temp/' + id);
-            if (!res.headersSent) {
-                await res.send({ code: "Service Unavailable" });
-            }
-        }
+    if (!authState.creds.registered) {
+      await sleep(2000);
+      try {
+        const raw = await sock.requestPairingCode(phone);
+        entry.pairingCode = raw?.match(/.{1,4}/g)?.join('-') ?? raw;
+        entry.status = 'paired';
+      } catch (err) {
+        entry.status = 'error';
+        entry.error  = err.message;
+        cleanup(sessionId, entry);
+      }
     }
 
-    return await getPaire();
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect } = update;
+      if (connection === 'open') {
+        entry.status = 'connected';
+        await sleep(3000);
+        cleanup(sessionId, entry);
+      }
+      if (connection === 'close') {
+        const code = lastDisconnect?.error?.output?.statusCode;
+        if (code !== DisconnectReason.loggedOut) {
+          // Reconnect once
+          setTimeout(() => startSession(sessionId, phone), 3000);
+        } else {
+          cleanup(sessionId, entry);
+        }
+      }
+    });
+
+  } catch (err) {
+    entry.status = 'error';
+    entry.error  = err.message;
+    cleanup(sessionId, entry);
+  }
+}
+
+// GET /code?number=917029666180
+router.get('/', async (req, res) => {
+  let num = (req.query.number || '').replace(/\D/g, '');
+  if (!num || num.length < 7) {
+    return res.json({ code: 'Invalid number' });
+  }
+
+  const sessionId = uuidv4();
+
+  // Start session in background
+  startSession(sessionId, num);
+
+  // Poll for pairing code up to 15s
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    await sleep(500);
+    const entry = sessions.get(sessionId);
+    if (!entry) break;
+    if (entry.pairingCode) {
+      return res.json({ code: entry.pairingCode });
+    }
+    if (entry.status === 'error') {
+      return res.json({ code: entry.error || 'Service Unavailable' });
+    }
+  }
+
+  return res.json({ code: 'Timeout - try again' });
 });
 
 module.exports = router;
