@@ -5,14 +5,15 @@ const fs      = require('fs');
 const path    = require('path');
 const { v4: uuidv4 } = require('uuid');
 const pino    = require('pino');
+const { MONGODB_URL, SESSION_NAME } = require('./config');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   Browsers,
   fetchLatestBaileysVersion,
+  delay,
 } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
 
 let router = express.Router();
 
@@ -25,15 +26,9 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-function cleanup(sessionId, entry) {
-  if (entry.cleaned) return;
-  entry.cleaned = true;
-  try {
-    if (entry.socket) { entry.socket.ws?.close(); entry.socket = null; }
-    const dir = path.join(SESSIONS_DIR, sessionId);
-    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-  } catch (_) {}
-  setTimeout(() => sessions.delete(sessionId), 60000);
+function removeFile(filePath) {
+  if (!fs.existsSync(filePath)) return false;
+  fs.rmSync(filePath, { recursive: true, force: true });
 }
 
 async function startSession(sessionId, phone) {
@@ -75,24 +70,54 @@ async function startSession(sessionId, phone) {
       } catch (err) {
         entry.status = 'error';
         entry.error  = err.message;
-        cleanup(sessionId, entry);
+        removeFile(authDir);
+        sessions.delete(sessionId);
       }
     }
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect } = update;
+
       if (connection === 'open') {
         entry.status = 'connected';
-        await sleep(3000);
-        cleanup(sessionId, entry);
+
+        try {
+          // Wait for creds to be saved
+          await delay(5000);
+          await delay(5000);
+
+          // Read creds and send as base64 session
+          const jsonData = await fs.promises.readFile(
+            path.join(authDir, 'creds.json'), 'utf-8'
+          );
+          const base64Session = Buffer.from(jsonData).toString('base64');
+
+          // Send thank you + session ID to self
+          await sock.sendMessage(sock.user.id, {
+            text: ` *🔥⃝ᴛʜᴀɴᴋ чᴏᴜ ғᴏʀ ᴄʜᴏᴏꜱɪɴɢ ᴍʀ-ᴀɴᴊᴀɴ⭜*\n*🔥⃝ᴛʜɪꜱ ɪꜱ ʏᴏᴜʀ ꜱᴇꜱꜱɪᴏɴ ɪᴅ ᴩʟᴇᴀꜱᴇ ᴅᴏ ɴᴏᴛ ꜱʜᴀʀᴇ ᴛʜɪꜱ ᴄᴏᴅᴇ ᴡɪᴛʜ ᴀɴʏᴏɴᴇ ⛒⭜*`
+          });
+          await sock.sendMessage(sock.user.id, {
+            text: SESSION_NAME + base64Session
+          });
+
+        } catch (err) {
+          console.error('[session] Failed to send session ID:', err.message);
+        }
+
+        await delay(1000);
+        // Close socket and cleanup
+        try { sock.ws?.close(); } catch (_) {}
+        removeFile(authDir);
+        setTimeout(() => sessions.delete(sessionId), 60000);
       }
+
       if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode;
         if (code !== DisconnectReason.loggedOut) {
-          // Reconnect once
           setTimeout(() => startSession(sessionId, phone), 3000);
         } else {
-          cleanup(sessionId, entry);
+          removeFile(authDir);
+          sessions.delete(sessionId);
         }
       }
     });
@@ -100,7 +125,8 @@ async function startSession(sessionId, phone) {
   } catch (err) {
     entry.status = 'error';
     entry.error  = err.message;
-    cleanup(sessionId, entry);
+    removeFile(authDir);
+    sessions.delete(sessionId);
   }
 }
 
