@@ -22,6 +22,8 @@ router.get('/', async (req, res) => {
     const id = makeid();
     let num = req.query.number;
 
+    if (!fs.existsSync('./temp')) fs.mkdirSync('./temp', { recursive: true });
+
     async function getPaire() {
         const { state, saveCreds } = await useMultiFileAuthState('./temp/' + id);
         try {
@@ -69,7 +71,7 @@ router.get('/', async (req, res) => {
                 }
             });
         } catch (err) {
-            console.log("service restated");
+            console.log("service restated:", err.message, err.stack);
             await removeFile('./temp/' + id);
             if (!res.headersSent) {
                 await res.send({ code: "Service Unavailable" });
