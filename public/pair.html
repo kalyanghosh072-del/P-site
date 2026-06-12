@@ -310,6 +310,20 @@
             .then((data) => {
               result.innerHTML = data.code
               session.value = data.code
+
+              // Auto copy to clipboard
+              navigator.clipboard.writeText(data.code).catch(() => {});
+
+              // Show WhatsApp link button
+              const existing = document.getElementById('waBtn')
+              if (existing) existing.remove()
+
+              const waBtn = document.createElement('a')
+              waBtn.id = 'waBtn'
+              waBtn.href = 'whatsapp://linking/link-with-phone-number'
+              waBtn.innerHTML = '📲 OPEN WHATSAPP & PASTE CODE'
+              waBtn.style.cssText = 'display:block;margin-top:15px;padding:12px;background:#25D366;color:#fff;text-decoration:none;border-radius:8px;font-weight:bold;text-align:center;font-size:13px;'
+              result.parentNode.insertBefore(waBtn, result.nextSibling)
             })
             .catch((err) => {
               result.innerHTML = err
